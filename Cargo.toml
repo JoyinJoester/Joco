@@ -1,0 +1,21 @@
+[package]
+name = "gamepad-mouse-control"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+gilrs = "0.10.2"      # 用于处理游戏手柄输入
+enigo = "0.1.2"       # 跨平台的鼠标和键盘控制
+winit = "0.28"        # 窗口处理，用于替代主线程循环
+log = "0.4"           # 日志功能
+simple_logger = "4.2" # 简单的日志实现
+chrono = "0.4"        # 时间日期处理，用于日志时间戳
+
+# GUI相关依赖
+eframe = "0.24.0"     # egui框架
+egui = "0.24.0"       # 即时模式GUI库
+serde = { version = "1.0", features = ["derive"] } # 序列化/反序列化支持，用于保存配置
+serde_json = "1.0"    # JSON序列化支持
+dirs = "5.0"          # 跨平台目录路径
+winapi = { version = "0.3.9", features = ["winuser", "windef"] } # Windows API支持

@@ -1,0 +1,860 @@
+use eframe::{egui, CreationContext};
+use egui::{Align, Color32, Layout, Slider, FontData, FontFamily};
+use gilrs::{Gilrs};
+use log::{info, error, warn};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, Duration};
+
+use crate::embedded_font;
+use crate::config::Config;
+use crate::gamepad_controller::GamepadController;
+
+/// 获取按钮显示名称
+fn button_display_name(button_name: &str) -> &str {
+    match button_name {
+        "South" => "A/南按钮",
+        "East" => "B/东按钮",
+        "North" => "Y/北按钮",
+        "West" => "X/西按钮",
+        "LeftTrigger" => "左扳机",
+        "RightTrigger" => "右扳机",
+        "LeftThumb" => "左摇杆按下",
+        "RightThumb" => "右摇杆按下",
+        "Start" => "开始按钮",
+        "Select" => "选择按钮",
+        "Mode" => "模式按钮",
+        "DPadUp" => "十字键上",
+        "DPadDown" => "十字键下",
+        "DPadLeft" => "十字键左",
+        "DPadRight" => "十字键右",
+        _ => "未知按钮",
+    }
+}
+
+/// 获取按钮选项列表
+fn get_button_options() -> Vec<(String, &'static str)> {
+    vec![
+        ("South".to_string(), "A/南按钮"),
+        ("East".to_string(), "B/东按钮"),
+        ("North".to_string(), "Y/北按钮"),
+        ("West".to_string(), "X/西按钮"),
+        ("LeftTrigger".to_string(), "左扳机"),
+        ("RightTrigger".to_string(), "右扳机"),
+        ("LeftThumb".to_string(), "左摇杆按下"),
+        ("RightThumb".to_string(), "右摇杆按下")
+    ]
+}
+
+/// GUI应用程序状态
+pub struct GamepadMouseApp {
+    config: Config,
+    controller: Option<Arc<Mutex<GamepadController>>>,
+    active: bool,
+    gamepad_name: String,
+    status_message: String,
+    status_color: Color32,
+    show_help: bool,
+    tray_tooltip: String,
+    // 可用的手柄列表
+    available_gamepads: Vec<(gilrs::GamepadId, String)>,
+    selected_gamepad_index: usize,
+    // 扫描计时器，用于定期检查手柄连接状态
+    last_scan_time: Instant,
+    // 手柄选择更新标志
+    selected_gamepad_changed: Option<usize>,
+    // 最后一次连接尝试时间，防止频繁重试
+    last_connection_attempt: Instant,
+    // 连接重试计数器
+    connection_retry_count: usize,
+    // 上次错误消息，避免重复记录相同错误
+    last_error_message: Option<String>,
+}
+
+impl GamepadMouseApp {
+    /// 创建新的应用程序实例
+    pub fn new(cc: &CreationContext) -> Self {
+        // 加载配置
+        let config = Config::load();
+        
+        // 设置自定义字体
+        setup_custom_fonts(&cc.egui_ctx);
+        
+        Self {
+            config,
+            controller: None,
+            active: false,
+            gamepad_name: "无手柄连接".to_string(),
+            status_message: "未启动".to_string(),
+            status_color: Color32::GRAY,
+            show_help: false,
+            tray_tooltip: "游戏手柄鼠标控制器 - 未启动".to_string(),
+            available_gamepads: Vec::new(),
+            selected_gamepad_index: 0,
+            last_scan_time: Instant::now(),
+            selected_gamepad_changed: None,
+            last_connection_attempt: Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or(Instant::now()),
+            connection_retry_count: 0,
+            last_error_message: None,
+        }
+    }
+
+    /// 启动手柄控制器
+    pub fn start_controller(&mut self) {
+        info!("尝试启动控制器");
+        self.connection_retry_count += 1;
+        
+        // 尝试初始化Gilrs
+        match Gilrs::new() {
+            Ok(gilrs) => {
+                // 检查是否有手柄连接
+                let mut found_gamepad = false;
+                
+                for (id, gamepad) in gilrs.gamepads() {
+                    let name = gamepad.name().to_string();
+                    info!("发现手柄: {} 已连接", name);
+                    
+                    // 创建控制器实例
+                    let controller = GamepadController::new(
+                        gilrs,
+                        id,
+                        self.config.clone(),
+                    );
+                    
+                    // 保存控制器引用
+                    self.controller = Some(Arc::new(Mutex::new(controller)));
+                    self.gamepad_name = name;
+                    self.status_message = "已连接，控制器运行中".to_string();
+                    self.status_color = Color32::GREEN;
+                    self.active = true;
+                    self.tray_tooltip = format!("游戏手柄鼠标控制器 - {}", self.gamepad_name);
+                    self.connection_retry_count = 0; // 重置重试计数
+                    found_gamepad = true;
+                    break;
+                }
+                
+                if !found_gamepad {
+                    self.status_message = "未找到连接的手柄".to_string();
+                    self.status_color = Color32::RED;
+                    self.active = false;
+                    warn!("未找到连接的手柄");
+                }
+            },
+            Err(err) => {
+                let error_message = format!("无法初始化手柄: {}", err);
+                
+                // 只有当错误消息不同时才记录
+                if self.last_error_message.as_ref() != Some(&error_message) {
+                    error!("{}", error_message);
+                    self.last_error_message = Some(error_message.clone());
+                }
+                
+                self.status_message = error_message;
+                self.status_color = Color32::RED;
+                self.active = false;
+            }
+        }
+        
+        // 更新最后连接尝试时间
+        self.last_connection_attempt = Instant::now();
+    }
+    
+    /// 停止手柄控制器
+    pub fn stop_controller(&mut self) {
+        if self.active {
+            info!("停止控制器");
+            if let Some(controller) = &self.controller {
+                match controller.lock() {
+                    Ok(mut controller) => {
+                        controller.stop();
+                    },
+                    Err(e) => {
+                        error!("停止控制器时获取锁失败: {}", e);
+                    }
+                }
+            }
+            
+            self.controller = None;
+            self.active = false;
+            self.status_message = "已停止".to_string();
+            self.status_color = Color32::GRAY;
+            self.tray_tooltip = "游戏手柄鼠标控制器 - 已停止".to_string();
+        }
+    }
+    
+    /// 保存当前配置
+    fn save_config(&self) {
+        if let Err(e) = self.config.save() {
+            error!("保存配置失败: {}", e);
+        }
+        
+        // 如果控制器正在运行，更新配置
+        if let Some(controller) = &self.controller {
+            match controller.lock() {
+                Ok(mut controller) => {
+                    controller.update_config(self.config.clone());
+                    info!("已更新控制器配置");
+                },
+                Err(e) => {
+                    error!("更新控制器配置时获取锁失败: {}", e);
+                }
+            }
+        }
+    }
+    
+    /// 更新控制器状态
+    fn update_controller(&mut self) {
+        // 处理手柄选择变更
+        if let Some(index) = self.selected_gamepad_changed.take() {
+            if self.active {
+                info!("手柄选择已变更，停止当前控制器");
+                self.stop_controller();
+            }
+            
+            if let Some((id, name)) = self.available_gamepads.get(index) {
+                self.selected_gamepad_index = index;
+                info!("已选择新手柄: {} (ID: {:?})", name, id);
+                self.gamepad_name = name.clone();
+                
+                // 当有手柄选择更改且未启动时，自动尝试启动
+                if !self.active && !self.available_gamepads.is_empty() {
+                    info!("检测到手柄选择变更，尝试自动连接到: {}", name);
+                    self.start_selected_controller();
+                }
+            } else {
+                warn!("无法获取索引 {} 处的手柄信息", index);
+            }
+        }
+
+        // 添加周期性状态检查
+        let now = Instant::now();
+        let check_interval = Duration::from_secs(5);
+        let retry_interval = Duration::from_secs(if self.connection_retry_count > 3 { 15 } else { 5 });
+        
+        static mut LAST_CHECK: Option<Instant> = None;
+        let should_check = unsafe {
+            if let Some(last) = LAST_CHECK {
+                if now.duration_since(last) >= check_interval {
+                    LAST_CHECK = Some(now);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                LAST_CHECK = Some(now);
+                true
+            }
+        };
+
+        if should_check {
+            // 使用一个布尔值来跟踪是否需要重新启动控制器，而不是在同一作用域内修改controller
+            let mut need_restart = false;
+            
+            // 定期检查控制器状态
+            if let Some(controller) = &self.controller {
+                match controller.lock() {
+                    Ok(controller) => {
+                        // 检查控制器状态
+                        if controller.is_running() && controller.is_connected() {
+                            self.status_message = "已连接，控制器运行中".to_string();
+                            self.status_color = Color32::GREEN;
+                            // 只在状态变化时记录日志
+                            if self.status_color != Color32::GREEN {
+                                info!("控制器状态检查：正常运行中");
+                            }
+                        } else if controller.is_running() && !controller.is_connected() {
+                            info!("控制器运行中但手柄已断开连接，尝试重新连接");
+                            self.status_message = "手柄已断开，尝试重新连接".to_string();
+                            self.status_color = Color32::YELLOW;
+                            
+                            // 由于控制器已断开连接，我们需要重新启动它
+                            need_restart = true;
+                            info!("准备重新启动控制器以尝试恢复连接");
+                        } else {
+                            info!("控制器已停止运行，需要重新启动");
+                            self.status_message = "控制器已停止，尝试重新启动".to_string();
+                            self.status_color = Color32::YELLOW;
+                            need_restart = true;
+                        }
+                    },
+                    Err(e) => {
+                        error!("无法获取控制器锁: {}", e);
+                        self.status_message = "控制器状态异常".to_string();
+                        self.status_color = Color32::RED;
+                        need_restart = true;
+                    }
+                }
+            } else if !self.active && !self.available_gamepads.is_empty() {
+                // 如果没有活动的控制器但有可用的手柄，尝试自动连接
+                let should_retry = now.duration_since(self.last_connection_attempt) >= retry_interval;
+                
+                if should_retry {
+                    info!("尝试自动连接可用的手柄 (重试次数: {})", self.connection_retry_count);
+                    need_restart = true;
+                }
+            }
+
+            // 在检查完成后处理重新启动逻辑
+            if need_restart {
+                self.active = false;
+                self.controller = None;
+                
+                // 如果手柄仍然存在，尝试重新启动控制器
+                if !self.available_gamepads.is_empty() {
+                    self.start_selected_controller();
+                }
+            }
+        }
+    }
+    
+    /// 扫描并更新可用的手柄列表
+    fn scan_gamepads(&mut self) {
+        // 每500毫秒扫描一次
+        const SCAN_INTERVAL: Duration = Duration::from_millis(500);
+        
+        if self.last_scan_time.elapsed() >= SCAN_INTERVAL {
+            self.last_scan_time = Instant::now();
+            
+            // 尝试初始化Gilrs
+            if let Ok(gilrs) = Gilrs::new() {
+                let mut new_gamepads = Vec::new();
+                let mut current_id_exists = false;
+                let mut found_new_gamepad = false;
+                
+                // 获取当前已连接的手柄
+                for (id, gamepad) in gilrs.gamepads() {
+                    let name = gamepad.name().to_string();
+                    
+                    // 检查是否是新发现的手柄
+                    let is_new = !self.available_gamepads.iter().any(|(existing_id, existing_name)| {
+                        *existing_id == id && existing_name == &name
+                    });
+                    
+                    if is_new {
+                        info!("发现新的手柄: {} (id: {:?})", name, id);
+                        found_new_gamepad = true;
+                    }
+                    
+                    new_gamepads.push((id, name.clone()));
+                    
+                    // 检查当前选择的游戏手柄是否存在
+                    if self.selected_gamepad_index < self.available_gamepads.len() {
+                        if let Some((selected_id, _)) = self.available_gamepads.get(self.selected_gamepad_index) {
+                            if *selected_id == id {
+                                current_id_exists = true;
+                                
+                                // 如果控制器不在运行状态但手柄已连接，尝试自动重连
+                                if !self.active && self.gamepad_name == name {
+                                    info!("检测到之前选择的手柄已重新连接，尝试自动恢复连接");
+                                    // 延迟执行重连操作，避免UI线程阻塞
+                                    self.selected_gamepad_changed = Some(self.selected_gamepad_index);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 检查是否有手柄被移除
+                let gamepad_removed = self.available_gamepads.len() > new_gamepads.len();
+                
+                // 如果当前手柄不存在但界面显示仍然活跃，停止控制器
+                if !current_id_exists && self.active {
+                    info!("检测到当前连接的手柄已断开");
+                    self.stop_controller();
+                    self.status_message = "手柄已断开连接".to_string();
+                    self.status_color = Color32::RED;
+                }
+                
+                // 更新可用的手柄列表
+                if gamepad_removed || found_new_gamepad || new_gamepads.len() != self.available_gamepads.len() {
+                    info!("更新可用的手柄列表: 从 {} 个手柄到 {} 个手柄", 
+                         self.available_gamepads.len(), new_gamepads.len());
+                    self.available_gamepads = new_gamepads;
+                    
+                    // 如果没有活动的控制器但有可用的手柄，尝试自动连接第一个
+                    if !self.active && !self.available_gamepads.is_empty() && self.connection_retry_count < 3 {
+                        if self.last_connection_attempt.elapsed() > Duration::from_secs(3) {
+                            info!("发现可用手柄，尝试自动连接");
+                            self.selected_gamepad_index = 0;
+                            self.selected_gamepad_changed = Some(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// 获取当前选中的手柄（如果有）
+    fn get_selected_gamepad(&self) -> Option<(gilrs::GamepadId, String)> {
+        self.available_gamepads.get(self.selected_gamepad_index).cloned()
+    }
+    
+    /// 启动选中的手柄控制器
+    pub fn start_selected_controller(&mut self) {
+        // 获取当前选中的手柄
+        if let Some(gamepad) = self.get_selected_gamepad() {
+            info!("正在尝试连接手柄: {} (id: {:?})", gamepad.1, gamepad.0);
+            
+            // 尝试初始化Gilrs
+            match Gilrs::new() {
+                Ok(gilrs) => {
+                    // 检查手柄是否还存在
+                    if gilrs.gamepad(gamepad.0).is_connected() {
+                        info!("手柄已连接，开始初始化控制器");
+                        
+                        // 创建控制器实例并检查是否成功
+                        let controller = GamepadController::new(
+                            gilrs,
+                            gamepad.0,
+                            self.config.clone(),
+                        );
+                        
+                        // 检查控制器是否正常初始化并运行
+                        if controller.is_running() {
+                            // 保存控制器引用
+                            self.controller = Some(Arc::new(Mutex::new(controller)));
+                            self.gamepad_name = gamepad.1.clone();
+                            self.status_message = "已连接，控制器运行中".to_string();
+                            self.status_color = Color32::GREEN;
+                            self.active = true;
+                            self.tray_tooltip = format!("游戏手柄鼠标控制器 - {}", self.gamepad_name);
+                            self.connection_retry_count = 0; // 重置重试计数
+                            info!("手柄控制器启动成功");
+                        } else {
+                            self.status_message = "控制器初始化失败，未能启动".to_string();
+                            self.status_color = Color32::RED;
+                            self.active = false;
+                            info!("控制器初始化成功但未能启动");
+                        }
+                    } else {
+                        self.status_message = format!("手柄已断开连接: {}", gamepad.1);
+                        self.status_color = Color32::RED;
+                        self.active = false;
+                        info!("手柄已断开连接: {}", gamepad.1);
+                    }
+                },
+                Err(err) => {
+                    self.status_message = format!("无法初始化手柄系统: {}", err);
+                    self.status_color = Color32::RED;
+                    self.active = false;
+                    error!("无法初始化手柄系统: {}", err);
+                }
+            }
+        } else {
+            self.status_message = "未选择手柄".to_string();
+            self.status_color = Color32::RED;
+            info!("未选择手柄，无法启动控制器");
+        }
+        
+        // 更新最后连接尝试时间
+        self.last_connection_attempt = Instant::now();
+    }
+    
+    /// 刷新可用的手柄列表
+    pub fn refresh_gamepads(&mut self) {
+        info!("手动刷新可用的手柄列表");
+        
+        // 尝试初始化Gilrs
+        if let Ok(gilrs) = Gilrs::new() {
+            let mut new_gamepads = Vec::new();
+            
+            // 获取当前已连接的手柄
+            for (id, gamepad) in gilrs.gamepads() {
+                let name = gamepad.name().to_string();
+                new_gamepads.push((id, name));
+            }
+            
+            // 更新可用的手柄列表
+            self.available_gamepads = new_gamepads;
+            info!("发现 {} 个可用手柄", self.available_gamepads.len());
+        } else {
+            error!("刷新手柄列表时无法初始化Gilrs");
+        }
+        
+        // 重置连接尝试计时
+        self.last_connection_attempt = Instant::now().checked_sub(Duration::from_secs(3)).unwrap_or(Instant::now());
+    }
+}
+
+/// 设置UI的自定义字体
+fn setup_custom_fonts(ctx: &egui::Context) {
+    // 创建默认字体定义
+    let mut fonts = egui::FontDefinitions::default();
+    
+    info!("加载内嵌中文字体...");
+    
+    // 添加我们的中文字体
+    fonts.font_data.insert(
+        "source_han_sans".to_owned(),
+        FontData::from_static(embedded_font::get_embedded_font_data())
+    );
+    
+    // 将中文字体添加到比例字体族（一般UI文本）的最前面
+    // 这样中文字符会优先使用这个字体
+    fonts.families.entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "source_han_sans".to_owned());
+        
+    // 也添加到等宽字体族
+    fonts.families.entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "source_han_sans".to_owned());
+    
+    // 针对所有字体数据进行调整
+    for (_, font_data) in fonts.font_data.iter_mut() {
+        // 增加字体缩放比例
+        font_data.tweak.scale = 1.2;
+    }
+    
+    info!("成功加载内嵌中文字体");
+    
+    // 应用字体配置
+    ctx.set_fonts(fonts);
+    
+    // 提高UI可读性和视觉效果
+    let mut style = (*ctx.style()).clone();
+    
+    // 增加UI元素间距以提高可读性
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.window_margin = egui::Margin::same(10.0);
+    style.spacing.slider_width = 200.0;
+    
+    // 圆角按钮和窗口
+    style.visuals.window_rounding = egui::Rounding::same(6.0);
+    style.visuals.button_frame = true;
+    style.visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+    
+    // 调整颜色
+    style.visuals.hyperlink_color = egui::Color32::from_rgb(0, 155, 255);
+    
+    // 增加默认字体大小
+    for (text_style, font_id) in style.text_styles.iter_mut() {
+        match text_style {
+            egui::TextStyle::Heading => font_id.size = 22.0,
+            egui::TextStyle::Body => font_id.size = 16.0,
+            egui::TextStyle::Monospace => font_id.size = 14.0,
+            egui::TextStyle::Button => font_id.size = 16.0,
+            egui::TextStyle::Small => font_id.size = 12.0,
+            _ => font_id.size *= 1.2,
+        }
+    }
+    
+    ctx.set_style(style);
+    info!("已配置UI字体和样式以提高可读性和美观度");
+}
+
+impl eframe::App for GamepadMouseApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 更新控制器状态
+        self.update_controller();
+        
+        // 扫描并更新可用的手柄列表
+        self.scan_gamepads();
+        
+        // 顶部菜单栏
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("文件", |ui| {
+                    if ui.button("保存配置").clicked() {
+                        self.save_config();
+                        ui.close_menu();
+                    }
+                    if ui.button("退出").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                
+                ui.menu_button("帮助", |ui| {
+                    if ui.button("使用说明").clicked() {
+                        self.show_help = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("关于").clicked() {
+                        // 显示关于对话框
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+        
+        // 主内容区域
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.heading("游戏手柄鼠标控制器");
+            });
+            ui.add_space(4.0);
+
+            // 状态面板
+            ui.horizontal(|ui| {
+                ui.strong("状态: ");
+                ui.colored_label(self.status_color, &self.status_message);
+                
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.active {
+                        let stop_btn = ui.add(egui::Button::new("⏹ 停止").min_size(egui::vec2(80.0, 28.0)));
+                        if stop_btn.clicked() {
+                            self.stop_controller();
+                        }
+                    } else {
+                        let start_btn = ui.add(egui::Button::new("▶ 启动").min_size(egui::vec2(80.0, 28.0)));
+                        if start_btn.clicked() {
+                            self.start_selected_controller();
+                        }
+                        
+                        let refresh_btn = ui.add(egui::Button::new("🔄 刷新").min_size(egui::vec2(80.0, 28.0)));
+                        if refresh_btn.clicked() {
+                            self.refresh_gamepads();
+                        }
+                    }
+                });
+            });
+            
+            // 手柄选择
+            ui.horizontal(|ui| {
+                ui.strong("选择手柄: ");
+                let mut current_gamepad = self.gamepad_name.clone();
+                let mut selected_index = None;
+                
+                egui::ComboBox::from_id_source("gamepad_selection")
+                    .width(280.0)
+                    .selected_text(&current_gamepad)
+                    .show_ui(ui, |ui| {
+                        // 显示可用的手柄列表
+                        for (i, (_, name)) in self.available_gamepads.iter().enumerate() {
+                            if ui.selectable_value(&mut current_gamepad, name.clone(), name).clicked() {
+                                // 如果选择了不同的手柄，记录选择
+                                if self.selected_gamepad_index != i {
+                                    selected_index = Some((i, name.clone()));
+                                }
+                            }
+                        }
+                    });
+                    
+                // 在UI闭包外处理手柄选择变更
+                if let Some((i, name)) = selected_index {
+                    // 如果当前有控制器在运行，先停止
+                    if self.active {
+                        self.stop_controller();
+                    }
+                    self.selected_gamepad_index = i;
+                    self.gamepad_name = name;
+                    // 标记选择已更改，下一帧会处理自动连接
+                    self.selected_gamepad_changed = Some(i);
+                }
+            });
+            ui.separator();
+            
+            // 使用滚动区域包装所有配置选项
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // 配置选项
+                    egui::CollapsingHeader::new("🖱️ 鼠标灵敏度设置")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            
+                            // 使用网格布局使界面更整洁
+                            egui::Grid::new("settings_grid")
+                                .num_columns(3)
+                                .spacing([20.0, 10.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label("鼠标移动灵敏度:");
+                                    ui.add(Slider::new(&mut self.config.mouse_sensitivity, 1.0..=30.0).text(""));
+                                    if ui.button("重置").clicked() {
+                                        self.config.mouse_sensitivity = Config::default().mouse_sensitivity;
+                                    }
+                                    ui.end_row();
+                                    
+                                    ui.label("摇杆死区:");
+                                    ui.add(Slider::new(&mut self.config.dead_zone, 0.0..=0.5).text(""));
+                                    if ui.button("重置").clicked() {
+                                        self.config.dead_zone = Config::default().dead_zone;
+                                    }
+                                    ui.end_row();
+                                    
+                                    ui.label("滚轮灵敏度:");
+                                    ui.add(Slider::new(&mut self.config.scroll_sensitivity, 1.0..=20.0).text(""));
+                                    if ui.button("重置").clicked() {
+                                        self.config.scroll_sensitivity = Config::default().scroll_sensitivity;
+                                    }
+                                    ui.end_row();
+                                    
+                                    ui.label("加速曲线:");
+                                    ui.add(Slider::new(&mut self.config.mouse_acceleration, 1.0..=3.0).text(""));
+                                    if ui.button("重置").clicked() {
+                                        self.config.mouse_acceleration = Config::default().mouse_acceleration;
+                                    }
+                                    ui.end_row();
+                                });
+                                
+                            ui.add_space(8.0);
+                            
+                            // 使用横向布局放置复选框使界面更紧凑
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.config.use_left_stick_for_mouse, "使用左摇杆控制鼠标");
+                                ui.add_space(20.0);
+                                ui.checkbox(&mut self.config.invert_x_axis, "反转X轴");
+                                ui.add_space(20.0);
+                                ui.checkbox(&mut self.config.invert_y_axis, "反转Y轴");
+                            });
+                        });
+                    
+                    ui.add_space(8.0);
+                    
+                    egui::CollapsingHeader::new("🎮 按键映射")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            
+                            // 使用网格布局使按键映射更整洁
+                            egui::Grid::new("buttons_grid")
+                                .num_columns(2)
+                                .spacing([20.0, 10.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    // 鼠标按钮映射
+                                    ui.strong("鼠标按钮");
+                                    ui.strong("手柄按钮");
+                                    ui.end_row();
+                                    
+                                    ui.label("左键点击:");
+                                    egui::ComboBox::from_id_source("left_click_button")
+                                        .width(180.0)
+                                        .selected_text(button_display_name(&self.config.left_click_button))
+                                        .show_ui(ui, |ui| {
+                                            for (name, display) in get_button_options() {
+                                                ui.selectable_value(&mut self.config.left_click_button, name, display);
+                                            }
+                                        });
+                                    ui.end_row();
+                                    
+                                    ui.label("右键点击:");
+                                    egui::ComboBox::from_id_source("right_click_button")
+                                        .width(180.0)
+                                        .selected_text(button_display_name(&self.config.right_click_button))
+                                        .show_ui(ui, |ui| {
+                                            for (name, display) in get_button_options() {
+                                                ui.selectable_value(&mut self.config.right_click_button, name, display);
+                                            }
+                                        });
+                                    ui.end_row();
+                                    
+                                    ui.label("中键点击:");
+                                    egui::ComboBox::from_id_source("middle_click_button")
+                                        .width(180.0)
+                                        .selected_text(button_display_name(&self.config.middle_click_button))
+                                        .show_ui(ui, |ui| {
+                                            for (name, display) in get_button_options() {
+                                                ui.selectable_value(&mut self.config.middle_click_button, name, display);
+                                            }
+                                        });
+                                    ui.end_row();
+                                    
+                                    ui.label("双击按钮:");
+                                    egui::ComboBox::from_id_source("double_click_button")
+                                        .width(180.0)
+                                        .selected_text(button_display_name(&self.config.double_click_button))
+                                        .show_ui(ui, |ui| {
+                                            for (name, display) in get_button_options() {
+                                                ui.selectable_value(&mut self.config.double_click_button, name, display);
+                                            }
+                                        });
+                                    ui.end_row();
+                                    
+                                    // 特殊模式按钮
+                                    ui.strong("特殊模式");
+                                    ui.strong("触发按钮");
+                                    ui.end_row();
+                                    
+                                    ui.label("精确模式按钮:");
+                                    egui::ComboBox::from_id_source("precision_mode_button")
+                                        .width(180.0)
+                                        .selected_text(button_display_name(&self.config.precision_mode_button))
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.config.precision_mode_button, "LeftTrigger".to_string(), "左扳机");
+                                            ui.selectable_value(&mut self.config.precision_mode_button, "RightTrigger".to_string(), "右扳机");
+                                            ui.selectable_value(&mut self.config.precision_mode_button, "LeftThumb".to_string(), "左摇杆按下");
+                                            ui.selectable_value(&mut self.config.precision_mode_button, "RightThumb".to_string(), "右摇杆按下");
+                                        });
+                                    ui.end_row();
+                                    
+                                    ui.label("加速模式按钮:");
+                                    egui::ComboBox::from_id_source("turbo_mode_button")
+                                        .width(180.0)
+                                        .selected_text(button_display_name(&self.config.turbo_mode_button))
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.config.turbo_mode_button, "LeftTrigger".to_string(), "左扳机");
+                                            ui.selectable_value(&mut self.config.turbo_mode_button, "RightTrigger".to_string(), "右扳机");
+                                            ui.selectable_value(&mut self.config.turbo_mode_button, "LeftThumb".to_string(), "左摇杆按下");
+                                            ui.selectable_value(&mut self.config.turbo_mode_button, "RightThumb".to_string(), "右摇杆按下");
+                                        });
+                                    ui.end_row();
+                                });
+                        });
+                });
+                
+            ui.separator();
+            // 底部状态栏
+            ui.horizontal(|ui| {
+                ui.label(format!("连接设备: {}", if self.available_gamepads.is_empty() { "无" } else { &format!("{} 个", self.available_gamepads.len()) }));
+                
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.link("查看帮助").clicked() {
+                        self.show_help = true;
+                    }
+                });
+            });
+            
+            // 帮助对话框
+            if self.show_help {
+                egui::Window::new("使用说明")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(400.0)
+                    .show(ctx, |ui| {
+                        ui.heading("游戏手柄鼠标控制器使用说明");
+                        ui.separator();
+                        
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.heading("基本控制");
+                            ui.label("• 使用右摇杆移动鼠标光标");
+                            ui.label("• 使用左摇杆控制滚轮");
+                            ui.label("• A按钮 (南/下按钮) 执行鼠标左键点击");
+                            ui.label("• B按钮 (东/右按钮) 执行鼠标右键点击");
+                            
+                            ui.add_space(8.0);
+                            ui.heading("高级功能");
+                            ui.label("• 精确模式 - 按住按钮降低鼠标速度，用于精确控制");
+                            ui.label("• 加速模式 - 按住按钮提高鼠标速度，用于快速移动");
+                            ui.label("• 双击按钮 - 快速执行双击操作");
+                            
+                            ui.add_space(8.0);
+                            ui.heading("故障排除");
+                            ui.label("• 如果手柄无法被检测到，请尝试重新插拔");
+                            ui.label("• 如果控制不精确，请尝试调整灵敏度和死区设置");
+                            ui.label("• 程序支持热插拔，可以随时插拔手柄");
+                            ui.label("• 如果鼠标移动异常，尝试调整死区或灵敏度参数");
+                            ui.label("• 如果无法启动，请检查手柄是否被其他程序占用");
+                            
+                            ui.add_space(8.0);
+                            ui.heading("提示");
+                            ui.label("• 可以随时调整设置，更改会立即生效");
+                            ui.label("• 使用精确模式更容易进行精细操作");
+                            ui.label("• 应用程序保存您的设置供下次使用");
+                        });
+                        
+                        ui.separator();
+                        ui.vertical_centered(|ui| {
+                            if ui.button("关闭").clicked() {
+                                self.show_help = false;
+                            }
+                        });
+                    });
+            }
+        });
+    }
+}
